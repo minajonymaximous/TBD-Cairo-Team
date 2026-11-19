@@ -1,0 +1,159 @@
+const TABS = {
+  "Antonious": " Antonious ",
+  "Michael": "Michael ",
+  "Margelet": "Margelet",
+  "Fady": "Fady ",
+  "Mina": "Mina",
+  "Mriham": "Mriham"
+};
+
+const PINS = {
+  "Manager": "9462",
+  "Mina": "4551",
+  "Fady": "1338",
+  "Mriham": "5160",
+  "Margelet": "8268",
+  "Antonious": "6930",
+  "Michael": "1903"
+};
+
+function doGet(e) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const pin = String((e && e.parameter && e.parameter.pin) || "").trim();
+  const matchedRole = Object.keys(PINS).find(r => PINS[r] === pin);
+  const allowedReps = (!matchedRole || matchedRole === "Manager") ? Object.keys(TABS) : [matchedRole];
+
+  // Read Notes tab (Columns: Rep | Ph Code | Customer Name | Note)
+  const notesSheet = ss.getSheetByName("Notes");
+  const notesList = [];
+  if (notesSheet && notesSheet.getLastRow() >= 2) {
+    const nRows = notesSheet.getRange(2, 1, notesSheet.getLastRow() - 1, 4).getValues();
+    nRows.forEach(r => {
+      if (r[0] || r[1] || r[2]) {
+        notesList.push({
+          rep: String(r[0] || "").trim(),
+          code: String(r[1] || "").trim(),
+          name: String(r[2] || "").trim(),
+          note: String(r[3] || "").trim()
+        });
+      }
+    });
+  }
+
+  const result = {};
+  allowedReps.forEach(repKey => {
+    const sheet = ss.getSheetByName(TABS[repKey]);
+    if (!sheet) return;
+    const target = Number(sheet.getRange("W9").getValue()) || 0;
+    const lastRow = sheet.getLastRow();
+    const rows = sheet.getRange(10, 1, Math.max(1, lastRow - 9), 19).getValues();
+    const custs = [];
+
+    for (let r = 0; r < rows.length; r++) {
+      const code = String(rows[r][0] || "").trim();
+      const name = String(rows[r][1] || "").trim();
+      if (name.includes("Planned Total") || code.includes("Planned Total")) break;
+      if (!name && !code) continue;
+
+      const items = [];
+      for (let col = 3; col <= 17; col += 2) {
+        items.push([Number(rows[r][col]) || 0, rows[r][col + 1] === true ? 1 : 0]);
+      }
+      custs.push({ r: r + 10, c: code, n: name, d: String(rows[r][2] || ""), i: items });
+    }
+    result[repKey] = { target: target, custs: custs };
+  });
+
+  return jsonOut({ status: "ok", data: result, notes: notesList });
+}
+
+function doPost(e) {
+  const p = JSON.parse(e.postData.contents);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  if (p.action === "updateTarget") {
+    if (String(p.pin || "").trim() !== PINS.Manager) {
+      return jsonOut({ status: "error", message: "Manager PIN required" });
+    }
+    const sheet = ss.getSheetByName(TABS[p.rep]);
+    if (!sheet) return jsonOut({ status: "error", message: "Tab not found" });
+    sheet.getRange("W9").setValue(Number(p.target) || 0);
+    return jsonOut({ status: "ok" });
+  }
+
+  if (p.action === "updatePharmacy") {
+    const sheet = ss.getSheetByName(TABS[p.rep]);
+    if (!sheet) return jsonOut({ status: "error", message: "Tab not found" });
+    const vals = [];
+    p.items.forEach(pair => {
+      vals.push(pair[0] > 0 ? Number(pair[0]) : "");
+      vals.push(Boolean(pair[1]));
+    });
+    sheet.getRange(p.row, 4, 1, 16).setValues([vals]);
+    upsertNoteInSheet(ss, p.rep, p.code, p.name, p.note || "");
+    return jsonOut({ status: "ok" });
+  }
+
+  if (p.action === "addPharmacy") {
+    const sheet = ss.getSheetByName(TABS[p.rep]);
+    if (!sheet) return jsonOut({ status: "error", message: "Tab not found" });
+    const lastRow = sheet.getLastRow();
+    const colAB = sheet.getRange(10, 1, lastRow - 9, 2).getValues();
+    let insertRow = lastRow - 2;
+    for (let i = 0; i < colAB.length; i++) {
+      if (String(colAB[i][0]).includes("Planned Total") || String(colAB[i][1]).includes("Planned Total")) {
+        insertRow = i + 10;
+        break;
+      }
+    }
+    sheet.insertRowBefore(insertRow);
+    const newRow = [p.code, p.name, p.date || ""];
+    p.items.forEach(pair => {
+      newRow.push(pair[0] > 0 ? Number(pair[0]) : "");
+      newRow.push(Boolean(pair[1]));
+    });
+    sheet.getRange(insertRow, 1, 1, 19).setValues([newRow]);
+    [5, 7, 9, 11, 13, 15, 17, 19].forEach(c => sheet.getRange(insertRow, c).insertCheckboxes());
+    if (p.note) upsertNoteInSheet(ss, p.rep, p.code, p.name, p.note);
+    return jsonOut({ status: "ok" });
+  }
+
+  if (p.action === "syncAll" && p.data) {
+    Object.keys(TABS).forEach(repKey => {
+      if (p.data[repKey] && Number(p.data[repKey].target) >= 0) {
+        const s = ss.getSheetByName(TABS[repKey]);
+        if (s) s.getRange("W9").setValue(Number(p.data[repKey].target));
+      }
+    });
+    return jsonOut({ status: "ok" });
+  }
+
+  return jsonOut({ status: "ok" });
+}
+
+function upsertNoteInSheet(ss, rep, code, name, noteText) {
+  let notesSheet = ss.getSheetByName("Notes");
+  if (!notesSheet) {
+    notesSheet = ss.insertSheet("Notes");
+    notesSheet.appendRow(["Rep", "Ph Code", "Customer Name", "Notes / Bonus"]);
+  }
+  const lastRow = notesSheet.getLastRow();
+  if (lastRow >= 2) {
+    const rows = notesSheet.getRange(2, 1, lastRow - 1, 4).getValues();
+    for (let i = 0; i < rows.length; i++) {
+      if (String(rows[i][0]).trim() === String(rep).trim() &&
+          String(rows[i][1]).trim() === String(code).trim() &&
+          String(rows[i][2]).trim() === String(name).trim()) {
+        notesSheet.getRange(i + 2, 4).setValue(noteText);
+        return;
+      }
+    }
+  }
+  if (noteText) {
+    notesSheet.appendRow([rep, code, name, noteText]);
+  }
+}
+
+function jsonOut(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
